@@ -82,6 +82,7 @@ class Runtime:
         self.product_secrets: ProductSecrets | None = None
         self.product_automation_events = None
         self.product_workspace: ProductWorkspaceCompatibility | None = None
+        self.workspace_capability: AbstractCapability[RunScope] | None = None
         self.product_continuations: ProductContinuationService | None = None
         self.product_drain: ProductDrainService | None = None
         if self.product is not None:
@@ -146,6 +147,7 @@ class Runtime:
         skills_directory: str = "/opt/moyai/skills",
     ) -> None:
         try:
+            self.workspace_capability = workspace
             self.configure_tracing()
             if self.product is not None:
                 await self.product.start()

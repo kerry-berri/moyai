@@ -145,6 +145,9 @@ class PreparedTurn:
     # Result settlement intent, retained if a checkpoint activity is interrupted.
     checkpoint_workspace: bool = False
     checkpoint_waiting: bool = False
+    # Chosen when the turn is prepared and recorded in workflow history, so a
+    # replay keeps the loop the turn started with.
+    engine: str = "pydantic"
 
 
 @dataclass

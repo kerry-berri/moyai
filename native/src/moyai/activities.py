@@ -15,6 +15,7 @@ from .agent_messages import read_agent_mail, read_agent_mail_v2
 from .answer_settlement import SNAPSHOT_WARNING
 from .computer_keepalive import keep_computer_alive
 from .contracts import CompletedTurn, PreparedTurn, SteeringInput
+from .deepagents_engine import deepagents_turn, engine_for
 from .history_handoff import HISTORY_ACTIVITIES
 from .images import hydrate
 from .lifecycle_tracing import scope_attributes, task_state
@@ -25,6 +26,12 @@ from .workspace_recovery import prepare_workspace
 
 @activity.defn(name="moyai_prepare_turn_v1")
 async def prepare_turn(turn_id: str, recover_workspace: bool = False) -> PreparedTurn:
+    prepared = await _prepare_turn(turn_id, recover_workspace)
+    prepared.engine = engine_for(current().settings, prepared)
+    return prepared
+
+
+async def _prepare_turn(turn_id: str, recover_workspace: bool) -> PreparedTurn:
     async def heartbeat():
         while True:
             activity.heartbeat("Verifying task authority and preparing the saved computer.")
@@ -164,6 +171,6 @@ ACTIVITIES = [
     prepare_turn, save_answer, save_computer, settle_answer, fail_turn, stopped_turn,
     prepare_steering, steering_receipt, keep_computer_alive, preserve_failed_workspace,
     *HISTORY_ACTIVITIES, *MAINTENANCE_ACTIVITIES,
-    read_agent_mail, read_agent_mail_v2,
+    read_agent_mail, read_agent_mail_v2, deepagents_turn,
 ]
 

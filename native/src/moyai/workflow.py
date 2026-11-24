@@ -81,6 +81,12 @@ PREPARE = {
     "schedule_to_close_timeout": timedelta(minutes=20),
     "heartbeat_timeout": timedelta(seconds=30),
 }
+DEEPAGENTS_TURN = {
+    # The whole graph runs in one activity; a retry would repeat its commands.
+    "start_to_close_timeout": timedelta(hours=2),
+    "heartbeat_timeout": timedelta(seconds=60),
+    "retry_policy": RetryPolicy(maximum_attempts=1),
+}
 ACTIVE_FILES = {
     "start_to_close_timeout": timedelta(minutes=4),
     "schedule_to_close_timeout": timedelta(minutes=12),
@@ -365,6 +371,34 @@ class TurnWorkflow(PydanticAIWorkflow):
         )
         self.pending_steering.remove(turn_id)
 
+    async def deepagents_turn(self, turn_id: str, prepared: PreparedTurn, checkpoint_workspace: bool) -> dict:
+        completed = await workflow.execute_activity(
+            "moyai_deepagents_turn_v1", prepared, result_type=CompletedTurn, **DEEPAGENTS_TURN,
+        )
+        # Guidance sent during the graph run is kept as a queued follow-up.
+        self.finished = True
+        await workflow.wait_condition(lambda: workflow.all_handlers_finished())
+        completed.checkpoint_workspace = checkpoint_workspace
+        accepted = await workflow.execute_activity(
+            "moyai_save_answer_v1", completed, result_type=bool, **CONTROL,
+        )
+        if not accepted:
+            await workflow.execute_activity(
+                "moyai_stopped_turn_v1", args=[turn_id, completed.conversation], **CONTROL,
+            )
+            return {"turn_id": turn_id, "status": "stopped"}
+        try:
+            await workflow.execute_activity(
+                "moyai_save_computer_v1", args=[turn_id, completed.workspace],
+                start_to_close_timeout=timedelta(
+                    minutes=17 if completed.workspace and completed.workspace.get("provider") == "lambda" else 3,
+                ),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except ActivityError:
+            await workflow.execute_activity("moyai_settle_answer_v1", turn_id, **CONTROL)
+        return {"turn_id": turn_id, "status": "completed"}
+
     @workflow.run
     async def run(self, turn_id: str, handoff: HistoryHandoff | None = None) -> dict:
         prepared: PreparedTurn | None = None
@@ -411,6 +445,8 @@ class TurnWorkflow(PydanticAIWorkflow):
             limits = await workflow.execute_activity(
                 "moyai_history_limits_v1", result_type=HistoryLimits, **CONTROL,
             ) if history_handoff else None
+            if prepared.engine == "deepagents" and resumed is None:
+                return await self.deepagents_turn(turn_id, prepared, checkpoint_workspace)
             runtime = current()
             reviewer = prepared.scope.responsibility_id is not None
             agent = runtime.attention_agent if prepared.scope.attention else runtime.responsibility_agent if reviewer else runtime.agent

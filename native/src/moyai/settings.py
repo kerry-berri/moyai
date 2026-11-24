@@ -50,6 +50,8 @@ class Settings(BaseSettings):
         default="openai/gpt-6-astra", validation_alias=AliasChoices("MOYAI_MODEL", "AGENT_MODEL")
     )
     model_catalog: str = Field(default="", validation_alias="MOYAI_MODELS")
+    # "deepagents" runs ordinary turns on the Deep Agents graph instead of the default loop.
+    agent_engine: Literal["pydantic", "deepagents"] = Field(default="pydantic", validation_alias="MOYAI_AGENT_ENGINE")
     mcp_allowed_origins: list[str] = Field(default_factory=list, validation_alias="MOYAI_MCP_ALLOWED_ORIGINS")
     temporal_address: str = Field(default="127.0.0.1:7233", validation_alias="TEMPORAL_ADDRESS")
     temporal_namespace: str = Field(default="default", validation_alias="TEMPORAL_NAMESPACE")
