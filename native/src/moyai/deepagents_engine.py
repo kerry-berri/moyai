@@ -10,16 +10,20 @@ surfaces, history and a later switch back to the default engine keep working.
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+import json
+import re
+from contextlib import nullcontext, suppress
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from deepagents import create_deep_agent
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.tools import BaseTool, StructuredTool
 from langchain_openai import ChatOpenAI
-from pydantic import TypeAdapter
+from pydantic import Field, TypeAdapter
 from pydantic_ai import Conversation, ConversationTypeAdapter
 from pydantic_ai.messages import (
     ModelMessage,
@@ -36,6 +40,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from .contracts import CompletedTurn, PreparedTurn
+from .deepagents_tracing import TurnTrace
 from .inference_usage import INFERENCE_ACTIVITY, InferenceActivity
 
 if TYPE_CHECKING:
@@ -50,6 +55,11 @@ INSTRUCTIONS = (
     "repository work belongs under /workspace. Inspect repository instructions before editing, "
     "preserve unrelated work, and say what you verified and what remains uncertain."
 )
+GATEWAY_TOOLS_INSTRUCTIONS = (
+    " Connected services (for example Slack, Notion or a CRM) are reached through the gateway: call "
+    "gateway_tools_search to find a tool and read its input schema, then gateway_tools_call to run it."
+)
+TOOL_OUTPUT_LIMIT = 40_000
 
 
 def engine_for(settings: Settings, prepared: PreparedTurn) -> str:
@@ -206,13 +216,131 @@ def graph_usage(messages: list[BaseMessage]) -> RunUsage:
     return usage
 
 
-def chat_model(runtime: Runtime, model: str) -> ChatOpenAI:
+class GatewayChatModel(ChatOpenAI):
+    """Each request runs inside its own model-call span when the turn is traced."""
+
+    turn_trace: Any = Field(default=None, exclude=True)
+
+    async def _agenerate(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+        if self.turn_trace is None:
+            return await super()._agenerate(messages, *args, **kwargs)
+        with self.turn_trace.chat(messages) as record:
+            result = await super()._agenerate(messages, *args, **kwargs)
+            record(result.generations[0].message)
+            return result
+
+
+def chat_model(runtime: Runtime, model: str, trace: TurnTrace | None = None) -> ChatOpenAI:
     """The worker's gateway client, so spend is recorded the same way as the default engine."""
     client: Any = getattr(runtime.models[model], "client")  # noqa: B009
-    return ChatOpenAI(
+    return GatewayChatModel(
         model=model, api_key=client.api_key, base_url=str(client.base_url),
         root_async_client=client, async_client=client.chat.completions,
         use_responses_api=True, store=False, use_previous_response_id=False, max_retries=0,
+        disable_streaming=True, turn_trace=trace,
+    )
+
+
+class GatewayTools:
+    """The MCP servers the worker's gateway key may use, behind a search tool and a call tool.
+
+    A gateway can expose hundreds of tools, too many to hand the model as
+    schemas, so the model searches the catalog and calls a tool by name. Calls
+    go straight to the gateway with the worker's key; Moyai's own connection
+    permissions and approvals do not apply to them.
+    """
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client, self.unavailable = client, ""
+        self.catalog: list[dict[str, Any]] | None = None
+
+    async def tools(self) -> list[dict[str, Any]]:
+        if self.catalog is None:
+            response = await self.client.get("/mcp-rest/tools/list")
+            response.raise_for_status()
+            body = response.json()
+            self.catalog = [
+                {
+                    "server": str((tool.get("mcp_info") or {}).get("server_name", "")),
+                    "server_id": str((tool.get("mcp_info") or {}).get("server_id", "")),
+                    "name": str(tool["name"]), "description": str(tool.get("description") or ""),
+                    "input_schema": tool.get("inputSchema") or {},
+                }
+                for tool in body.get("tools", [])
+            ]
+            self.unavailable = str(body.get("message") or "") if body.get("error") else ""
+        return self.catalog
+
+    async def search(self, query: str, server: str = "") -> str:
+        """Find connected-service tools. Returns each match's server, name, description and input schema.
+
+        Args:
+            query: Words describing the task, for example "send slack message". Empty lists every tool name.
+            server: Limit the search to one server name.
+        """
+        try:
+            tools = await self.tools()
+        except httpx.HTTPError as error:
+            return f"The gateway tool catalog is unavailable: {type(error).__name__}."
+        tools = [tool for tool in tools if not server or tool["server"].lower() == server.lower()]
+        words = set(re.findall(r"[a-z0-9]+", query.lower()))
+        if not words:
+            names: dict[str, list[str]] = {}
+            for tool in tools:
+                names.setdefault(tool["server"], []).append(tool["name"])
+            return json.dumps(names)[:TOOL_OUTPUT_LIMIT] if names else self.unavailable or "No gateway tools."
+
+        def score(tool: dict[str, Any]) -> int:
+            name = set(re.findall(r"[a-z0-9]+", (tool["server"] + " " + tool["name"]).lower()))
+            return 3 * len(words & name) + len(words & set(re.findall(r"[a-z0-9]+", tool["description"].lower())))
+
+        ranked = sorted(((score(tool), tool) for tool in tools), key=lambda item: -item[0])
+        matches = [
+            {**{key: tool[key] for key in ("server", "name", "input_schema")}, "description": tool["description"][:1500]}
+            for points, tool in ranked[:6] if points
+        ]
+        if not matches:
+            return self.unavailable or "No gateway tool matches. Search with an empty query to list every tool name."
+        return json.dumps(matches)[:TOOL_OUTPUT_LIMIT]
+
+    async def call(self, server: str, name: str, arguments: dict[str, Any] | None = None) -> str:
+        """Run one connected-service tool found with gateway_tools_search.
+
+        Args:
+            server: The tool's server name from the search result.
+            name: The tool's name from the search result.
+            arguments: Arguments matching the tool's input schema.
+        """
+        try:
+            tools = await self.tools()
+            found = [tool for tool in tools if tool["name"] == name and tool["server"].lower() == server.lower()]
+            if not found:
+                return f"No gateway tool {name!r} on server {server!r}. Use gateway_tools_search first."
+            response = await self.client.post("/mcp-rest/tools/call", json={
+                "server_id": found[0]["server_id"], "name": name, "arguments": arguments or {},
+            })
+        except httpx.HTTPError as error:
+            # The request may have reached the service: report it, never resend it.
+            return f"The gateway did not confirm this call ({type(error).__name__}). Check its effect before retrying."
+        if response.status_code >= 400:
+            return f"The gateway refused the call with HTTP {response.status_code}: {response.text[:2000]}"
+        body = response.json()
+        text = "\n".join(str(part.get("text", "")) for part in body.get("content") or [] if part.get("type") == "text")
+        if not text and body.get("structuredContent") is not None:
+            text = json.dumps(body["structuredContent"])
+        return ("Tool error: " if body.get("isError") else "") + text[:TOOL_OUTPUT_LIMIT]
+
+    def as_tools(self) -> list[BaseTool]:
+        return [
+            StructuredTool.from_function(coroutine=self.search, name="gateway_tools_search", parse_docstring=True),
+            StructuredTool.from_function(coroutine=self.call, name="gateway_tools_call", parse_docstring=True),
+        ]
+
+
+def gateway_client(settings: Settings) -> httpx.AsyncClient:
+    root = settings.gateway_url.rstrip("/").removesuffix("/v1")
+    return httpx.AsyncClient(
+        base_url=root, headers={"Authorization": "Bearer " + settings.gateway_key.get_secret_value()}, timeout=120,
     )
 
 
@@ -238,6 +366,7 @@ def workspace_for(runtime: Runtime, reference: dict[str, Any] | None) -> Workspa
 
 async def run_turn(
     prepared: PreparedTurn, *, model: Any, workspace: Workspace, recursion_limit: int = 500,
+    tools: list[BaseTool] | None = None, callbacks: list[Any] | None = None,
 ) -> CompletedTurn:
     """Run one prompt to a final answer. No Temporal or database state is touched here."""
     scope = prepared.scope
@@ -247,11 +376,12 @@ async def run_turn(
     )
     history = to_graph_messages(conversation.messages)
     graph = create_deep_agent(
-        model=model, system_prompt=INSTRUCTIONS,
+        model=model, tools=tools or [],
+        system_prompt=INSTRUCTIONS + (GATEWAY_TOOLS_INSTRUCTIONS if tools else ""),
         backend=WorkspaceSandbox(workspace, asyncio.get_running_loop()),
     )
     graph_input: Any = {"messages": [*history, HumanMessage(prepared.prompt)]}
-    state = await graph.ainvoke(graph_input, config={"recursion_limit": recursion_limit})
+    state = await graph.ainvoke(graph_input, config={"recursion_limit": recursion_limit, "callbacks": callbacks or []})
     produced = state["messages"][len(history):]
     answers = [message for message in produced if isinstance(message, AIMessage) and not message.tool_calls]
     if not answers:
@@ -288,12 +418,19 @@ async def deepagents_turn(prepared: PreparedTurn) -> CompletedTurn:
         f"{info.workflow_namespace}/{info.workflow_id}/{info.workflow_run_id}/{info.activity_id}/{info.attempt}",
     ))
     heartbeats = asyncio.create_task(heartbeat())
+    trace = TurnTrace(runtime.tracing, scope) if runtime.tracing else None
+    gateway = gateway_client(runtime.settings) if runtime.settings.deepagents_gateway_tools else None
     try:
-        return await run_turn(
-            prepared, model=chat_model(runtime, scope.model),
-            workspace=workspace_for(runtime, prepared.workspace),
-        )
+        with trace.agent() if trace else nullcontext():
+            return await run_turn(
+                prepared, model=chat_model(runtime, scope.model, trace),
+                workspace=workspace_for(runtime, prepared.workspace),
+                tools=GatewayTools(gateway).as_tools() if gateway else None,
+                callbacks=[trace.callback] if trace else None,
+            )
     finally:
+        if gateway:
+            await gateway.aclose()
         INFERENCE_ACTIVITY.reset(token)
         heartbeats.cancel()
         with suppress(asyncio.CancelledError):

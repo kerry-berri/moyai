@@ -183,9 +183,10 @@ class LensTracing:
         )
         options: dict[str, Any] = {}
         instrumentation_type = InstrumentationSettings
+        self.include_content, self.secrets = settings.trace_include_content, list[str]()
         if settings.trace_include_content:
             instrumentation_type = _PromptResponseInstrumentation
-            options["secrets"] = [
+            self.secrets = options["secrets"] = [
                 value.get_secret_value()
                 for name in type(settings).model_fields
                 if isinstance(value := getattr(settings, name), SecretStr) and value.get_secret_value()

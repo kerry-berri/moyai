@@ -113,8 +113,9 @@ def test_only_ordinary_turns_change_engine():
 async def test_deepagents_turn_completes_in_real_temporal_server(runtime, active, monkeypatch, tmp_path):
     _session, turn, _prepared = active
     runtime.settings.agent_engine = "deepagents"
+    runtime.settings.deepagents_gateway_tools = False
     model = ScriptedModel(script=coding_script(tmp_path / "computer"), seen=[])
-    monkeypatch.setattr(deepagents_engine, "chat_model", lambda _runtime, _model: model)
+    monkeypatch.setattr(deepagents_engine, "chat_model", lambda _runtime, _model, _trace=None: model)
     environment = await WorkflowEnvironment.start_local(
         plugins=[PydanticAIPlugin()],
         data_converter=DataConverter(payload_codec=EncryptedPayloadCodec(runtime.security, runtime.objects)),
@@ -132,3 +133,76 @@ async def test_deepagents_turn_completes_in_real_temporal_server(runtime, active
         assert runtime.security.unseal(saved.result).decode() == "The file is written."
     assert (tmp_path / "computer" / "note.txt").read_text().strip() == "from deep agents"
     assert len(model.seen) == 3
+
+
+async def test_traced_turn_exports_model_and_tool_spans(tmp_path):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from moyai.deepagents_tracing import TurnTrace
+
+    exporter, provider = InMemorySpanExporter(), TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracing: Any = SimpleNamespace(
+        instrumentation=SimpleNamespace(tracer=provider.get_tracer("test")), include_content=True, secrets=["hunter22"],
+    )
+    prepared = replace(prepared_turn(), prompt="Write the note. The password is hunter22.")
+    trace = TurnTrace(tracing, prepared.scope)
+
+    class Traced(ScriptedModel):
+        def _generate(self, messages: list[Any], *args: Any, **kwargs: Any) -> ChatResult:
+            with trace.chat(messages) as record:
+                result = super()._generate(messages, *args, **kwargs)
+                record(result.generations[0].message)
+                return result
+
+    with trace.agent():
+        await run_turn(
+            prepared, model=Traced(script=coding_script(tmp_path), seen=[]),
+            workspace=Workspace(LocalWorkspaceBackend(tmp_path)), callbacks=[trace.callback],
+        )
+    spans = exporter.get_finished_spans()
+    agent = next(span for span in spans if span.name == "invoke_agent moyai")
+    chats = [span for span in spans if span.attributes["gen_ai.operation.name"] == "chat"]
+    tools = [span for span in spans if span.attributes["gen_ai.operation.name"] == "execute_tool"]
+    assert len(chats) == 3 and [span.attributes["gen_ai.tool.name"] for span in tools] == ["write_file", "execute"]
+    assert all(span.parent.span_id == agent.context.span_id for span in [*chats, *tools])
+    assert all("moyai_session_id" in span.attributes["metadata"] for span in spans)
+    prompt = chats[0].attributes["gen_ai.input.messages"]
+    assert "Write the note." in prompt and "hunter22" not in prompt
+    assert "The file is written." in chats[-1].attributes["gen_ai.output.messages"]
+    # Tool arguments and results stay out of traces even with content on.
+    assert all("from deep agents" not in str(dict(span.attributes)) for span in spans)
+
+
+async def test_gateway_tools_search_and_call_with_the_workers_key():
+    import json
+
+    import httpx
+
+    from moyai.deepagents_engine import GatewayTools
+
+    calls: list[Any] = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/mcp-rest/tools/list":
+            return httpx.Response(200, json={"tools": [
+                {"name": "slack_send_message", "description": "Send a message to a channel.",
+                 "inputSchema": {"type": "object"}, "mcp_info": {"server_name": "slack", "server_id": "s1"}},
+                {"name": "notion-search", "description": "Search pages.", "mcp_info": {"server_name": "notion", "server_id": "n1"}},
+            ]})
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "sent"}], "isError": False})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gateway), base_url="https://gateway.test") as client:
+        search, call = GatewayTools(client).as_tools()
+        found = json.loads(await search.ainvoke({"query": "send a slack message"}))
+        assert [tool["name"] for tool in found] == ["slack_send_message"] and found[0]["server"] == "slack"
+        assert json.loads(await search.ainvoke({"query": ""})) == {"slack": ["slack_send_message"], "notion": ["notion-search"]}
+        assert await call.ainvoke({"server": "slack", "name": "slack_send_message", "arguments": {"text": "hi"}}) == "sent"
+        assert "No gateway tool" in await call.ainvoke({"server": "slack", "name": "missing"})
+    assert calls == [{"server_id": "s1", "name": "slack_send_message", "arguments": {"text": "hi"}}]
