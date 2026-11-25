@@ -170,11 +170,13 @@ async def test_traced_turn_exports_model_and_tool_spans(tmp_path):
         )
     spans = exporter.get_finished_spans()
     agent = next(span for span in spans if span.name == "invoke_agent moyai")
-    chats = [span for span in spans if span.attributes["gen_ai.operation.name"] == "chat"]
-    tools = [span for span in spans if span.attributes["gen_ai.operation.name"] == "execute_tool"]
+    chats = [span for span in spans if span.attributes.get("gen_ai.operation.name") == "chat"]
+    tools = [span for span in spans if span.attributes.get("gen_ai.operation.name") == "execute_tool"]
     assert len(chats) == 3 and [span.attributes["gen_ai.tool.name"] for span in tools] == ["write_file", "execute"]
     assert all(span.parent.span_id == agent.context.span_id for span in [*chats, *tools])
     assert all("moyai_session_id" in span.attributes["metadata"] for span in spans)
+    attempts = [span for span in spans if span.name == "gateway.request"]
+    assert [span.parent.span_id for span in attempts] == [span.context.span_id for span in chats]
     # The gateway call ID is what Lens prices from; a Responses ID is only the fallback.
     assert chats[0].attributes["gen_ai.response.id"] == "resp_1" and "litellm.call_id" not in chats[0].attributes
     assert chats[1].attributes["litellm.call_id"] == "call-id-2" and "gen_ai.response.id" not in chats[1].attributes

@@ -42,6 +42,7 @@ class TurnTrace:
 
     def __init__(self, tracing: LensTracing, scope: RunScope):
         self.tracer = tracing.instrumentation.tracer
+        self.gateway_tracer = getattr(tracing, "gateway_tracer", None) or self.tracer
         self.include_content, self.secrets = tracing.include_content, tracing.secrets
         self.scope, self.base = scope, {**scope_attributes(scope), "moyai.engine": "deepagents"}
         self.parent: otel_context.Context | None = None
@@ -102,7 +103,12 @@ class TurnTrace:
                     span.set_attribute("litellm.call_id", str(call_id))
                 elif reply.id:
                     span.set_attribute("gen_ai.response.id", reply.id)
-            yield record
+            # Lens prices a model call from the gateway's spend log, matched on the span
+            # the request was sent under, so each request gets its own attempt span.
+            with self.gateway_tracer.start_as_current_span("gateway.request", kind=SpanKind.CLIENT, attributes={
+                **self.base, "litellm.gateway.attempt": "true", "http.request.method": "POST",
+            }):
+                yield record
 
 
 class _ToolSpans(BaseCallbackHandler):

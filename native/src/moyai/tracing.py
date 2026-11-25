@@ -197,6 +197,7 @@ class LensTracing:
             include_model_request_parameters=False,
             **options,
         )
+        self.gateway_tracer = self.logfire.config.get_tracer_provider().get_tracer("litellm.gateway.client")
         self.plugin = LogfirePlugin(setup_logfire=lambda: self.logfire, metrics=False)
 
     def instrument_app(self, app: FastAPI) -> None:
