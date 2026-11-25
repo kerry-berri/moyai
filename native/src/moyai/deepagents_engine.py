@@ -222,11 +222,13 @@ class GatewayChatModel(ChatOpenAI):
     turn_trace: Any = Field(default=None, exclude=True)
 
     async def _agenerate(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
-        if self.turn_trace is None:
-            return await super()._agenerate(messages, *args, **kwargs)
-        with self.turn_trace.chat(messages) as record:
+        with self.turn_trace.chat(messages) if self.turn_trace else nullcontext() as record:
             result = await super()._agenerate(messages, *args, **kwargs)
-            record(result.generations[0].message)
+            message = result.generations[0].message
+            if record:
+                record(message)
+            # Only the trace needs the gateway's headers; keep them out of saved history.
+            message.response_metadata.pop("headers", None)
             return result
 
 
@@ -237,7 +239,7 @@ def chat_model(runtime: Runtime, model: str, trace: TurnTrace | None = None) -> 
         model=model, api_key=client.api_key, base_url=str(client.base_url),
         root_async_client=client, async_client=client.chat.completions,
         use_responses_api=True, store=False, use_previous_response_id=False, max_retries=0,
-        disable_streaming=True, turn_trace=trace,
+        disable_streaming=True, include_response_headers=True, turn_trace=trace,
     )
 
 

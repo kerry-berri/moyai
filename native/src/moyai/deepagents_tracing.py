@@ -95,7 +95,12 @@ class TurnTrace:
                     "gen_ai.response.finish_reasons": ["tool_call" if reply.tool_calls else "stop"],
                     "gen_ai.output.messages": self.messages([reply]),
                 })
-                if reply.id:
+                # Lens prices a call from the gateway's spend log, which is keyed by the
+                # gateway call ID; the Responses ID it returns is not in that log.
+                headers: Any = reply.response_metadata.get("headers") or {}
+                if call_id := headers.get("x-litellm-call-id"):
+                    span.set_attribute("litellm.call_id", str(call_id))
+                elif reply.id:
                     span.set_attribute("gen_ai.response.id", reply.id)
             yield record
 

@@ -160,9 +160,12 @@ async def test_traced_turn_exports_model_and_tool_spans(tmp_path):
                 record(result.generations[0].message)
                 return result
 
+    script = coding_script(tmp_path)
+    script[0].id, script[1].id = "resp_1", "resp_2"
+    script[1].response_metadata = {"headers": {"x-litellm-call-id": "call-id-2"}}
     with trace.agent():
         await run_turn(
-            prepared, model=Traced(script=coding_script(tmp_path), seen=[]),
+            prepared, model=Traced(script=script, seen=[]),
             workspace=Workspace(LocalWorkspaceBackend(tmp_path)), callbacks=[trace.callback],
         )
     spans = exporter.get_finished_spans()
@@ -172,6 +175,9 @@ async def test_traced_turn_exports_model_and_tool_spans(tmp_path):
     assert len(chats) == 3 and [span.attributes["gen_ai.tool.name"] for span in tools] == ["write_file", "execute"]
     assert all(span.parent.span_id == agent.context.span_id for span in [*chats, *tools])
     assert all("moyai_session_id" in span.attributes["metadata"] for span in spans)
+    # The gateway call ID is what Lens prices from; a Responses ID is only the fallback.
+    assert chats[0].attributes["gen_ai.response.id"] == "resp_1" and "litellm.call_id" not in chats[0].attributes
+    assert chats[1].attributes["litellm.call_id"] == "call-id-2" and "gen_ai.response.id" not in chats[1].attributes
     prompt = chats[0].attributes["gen_ai.input.messages"]
     assert "Write the note." in prompt and "hunter22" not in prompt
     assert "The file is written." in chats[-1].attributes["gen_ai.output.messages"]
